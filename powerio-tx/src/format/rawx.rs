@@ -61,6 +61,11 @@ const TRANSFORMER_IMPEDANCE_FIELDS: &[&str] = &[
     "anstar",
 ];
 const AREA_FIELDS: &[&str] = &["iarea", "isw", "pdes", "ptol", "arname"];
+/// The revision 35 FACTS device record, field for field.
+const FACTS_FIELDS: &[&str] = &[
+    "name", "ibus", "jbus", "mode", "pdes", "qdes", "vset", "shmx", "trmx", "vtmn", "vtmx", "vsmx",
+    "imx", "linx", "rmpct", "owner", "set1", "set2", "vsref", "fcreg", "nreg", "mname",
+];
 const TWO_TERMINAL_DC_FIELDS: &[&str] = &[
     "name", "mdc", "rdc", "setvl", "vschd", "vcmod", "rcomp", "delti", "met", "dcvmin", "cccitmx",
     "cccacc", "ipr", "nbr", "anmxr", "anmnr", "rcr", "xcr", "ebasr", "trr", "tapr", "tmxr", "tmnr",
@@ -113,7 +118,6 @@ const UNSUPPORTED_TABLES: &[(&str, &str)] = &[
     ("zone", "zones"),
     ("iatransfer", "interarea transfers"),
     ("owner", "owners"),
-    ("facts", "FACTS devices"),
     ("gne", "GNE devices"),
     ("indmach", "induction machines"),
 ];
@@ -441,6 +445,15 @@ pub(super) fn parse_rawx_source(
     raw.push_str("0 / END OF ZONE DATA, BEGIN INTER-AREA TRANSFER DATA\n");
     raw.push_str("0 / END OF INTER-AREA TRANSFER DATA, BEGIN OWNER DATA\n");
     raw.push_str("0 / END OF OWNER DATA, BEGIN FACTS DEVICE DATA\n");
+    append_simple_table(
+        network,
+        "facts",
+        FACTS_FIELDS,
+        &["name", "mname"],
+        &mut raw,
+        warnings,
+        &mut substituted_strings,
+    )?;
     raw.push_str("0 / END OF FACTS DEVICE DATA, BEGIN SWITCHED SHUNT DATA\n");
     append_simple_table(
         network,
@@ -2013,6 +2026,13 @@ fn raw_to_rawx(net: &BalancedNetwork, raw: &str, diagnostics: &mut Diagnostics) 
         &["shntid", "rmidnt"],
         &sections,
     );
+    add_simple_output_table(
+        &mut network,
+        "facts",
+        FACTS_FIELDS,
+        &["name", "mname"],
+        &sections,
+    );
     add_system_switch_output_table(&mut network, net, diagnostics);
     if sections
         .get("IMPEDANCE CORRECTION")
@@ -2168,6 +2188,7 @@ fn add_simple_output_table(
         "acline" => "BRANCH",
         "area" => "AREA",
         "swshunt" => "SWITCHED SHUNT",
+        "facts" => "FACTS DEVICE",
         _ => return,
     };
     let rows: Vec<Value> = sections
