@@ -56,8 +56,8 @@ pub mod geo;
 pub mod hvdc;
 pub mod indexed;
 pub mod islands;
-pub mod merge;
 pub mod lcc;
+pub mod merge;
 pub mod network;
 mod normalize;
 mod operations;
@@ -137,12 +137,12 @@ pub use geo::{
 pub use hvdc::{HvdcInjections, HvdcTerminalInjection, HvdcTreatment};
 pub use indexed::{ConnectivityReport, IndexCore, IndexedNetwork};
 pub use islands::{Island, IslandPartition, IslandReferencePolicy, IslandReferenceReport};
+pub use lcc::{LccConverterState, LccOperatingPoint};
 pub use merge::{
     BusGroup, BusMerge, BusMergeRule, MergeSurvivor, MergedCharging, MergedFlows,
     PSSE_DEFAULT_ZERO_IMPEDANCE_THRESHOLD, RemovalReason, RemovedBranch, RemovedFlow,
     RemovedFlowMethod, RemovedFlows, RemovedSwitch, ZeroImpedanceRule,
 };
-pub use lcc::{LccConverterState, LccOperatingPoint};
 pub use network::{
     AcDcConverterControlMode, ActivePowerControl, Area, BalancedNetwork, BoundaryLine,
     BoundaryLineGeneration, Branch, BranchCharging, BranchCurrentRatings, BranchRatingSet,
