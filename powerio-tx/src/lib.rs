@@ -57,6 +57,7 @@ pub mod hvdc;
 pub mod indexed;
 pub mod islands;
 pub mod merge;
+pub mod lcc;
 pub mod network;
 mod normalize;
 mod operations;
@@ -141,6 +142,7 @@ pub use merge::{
     PSSE_DEFAULT_ZERO_IMPEDANCE_THRESHOLD, RemovalReason, RemovedBranch, RemovedFlow,
     RemovedFlowMethod, RemovedFlows, RemovedSwitch, ZeroImpedanceRule,
 };
+pub use lcc::{LccConverterState, LccOperatingPoint};
 pub use network::{
     AcDcConverterControlMode, ActivePowerControl, Area, BalancedNetwork, BoundaryLine,
     BoundaryLineGeneration, Branch, BranchCharging, BranchCurrentRatings, BranchRatingSet,
