@@ -235,3 +235,13 @@ fn a_selection_outside_the_network_is_refused() {
         (0, view.n())
     );
 }
+
+#[test]
+fn an_all_reference_network_agrees_for_dense_and_sparse_solvers() {
+    let net = net(&[(1, BusType::Ref), (2, BusType::Ref)], &[(1, 2, 0.1)]);
+    let view = IndexedNetwork::new(&net);
+    let expected = calc_ptdf_lodf_with_options(&view, &options(SensitivitySolver::Dense)).unwrap();
+    let actual = calc_ptdf_lodf_with_options(&view, &options(SensitivitySolver::Sparse)).unwrap();
+    assert_close(&actual.ptdf, &expected.ptdf, 0.0, "PTDF");
+    assert_close(&actual.lodf, &expected.lodf, 0.0, "LODF");
+}

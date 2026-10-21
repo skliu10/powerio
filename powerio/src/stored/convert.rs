@@ -1062,21 +1062,27 @@ fn multiconductor_identity_order(
     Ok(identities)
 }
 
-fn encode_dc_pf_instance(instance: &powerio_prob::DcPfInstance) -> Result<dto::DcPfInstance> {
-    // The stored instance is its network; reading it back derives the
-    // specifications under the default HVDC treatment. An instance that
-    // leaves injecting HVDC lines out would come back with them in.
-    if instance.hvdc_treatment() != powerio_tx::HvdcTreatment::FixedInjection {
-        let ignored = instance.network().calc_hvdc_injections().n_injecting();
+fn check_stored_hvdc(
+    network: &powerio_tx::BalancedNetwork,
+    treatment: powerio_tx::HvdcTreatment,
+) -> Result<()> {
+    // IR has no HVDC-treatment field. Refuse a round trip that would restore
+    // omitted injections when an instance is rebuilt or projected to DC.
+    if treatment != powerio_tx::HvdcTreatment::FixedInjection {
+        let ignored = network.calc_hvdc_injections().n_injecting();
         if ignored > 0 {
             return Err(invalid(format!(
-                "this DC power flow instance leaves {ignored} in service HVDC line(s) out of its \
-                 injections, and PowerIO IR stores a DC power flow instance under the fixed \
-                 injection HVDC treatment only; set the lines out of service in the network \
-                 instead"
+                "this power flow instance leaves {ignored} in service HVDC line(s) out of its \
+                 injections, and PowerIO IR stores the fixed injection HVDC treatment only; \
+                 set the lines out of service in the network instead"
             )));
         }
     }
+    Ok(())
+}
+
+fn encode_dc_pf_instance(instance: &powerio_prob::DcPfInstance) -> Result<dto::DcPfInstance> {
+    check_stored_hvdc(instance.network(), instance.hvdc_treatment())?;
     let network = with_component_ids(instance.network().clone());
     Ok(dto::DcPfInstance {
         initial_point: instance
@@ -1095,6 +1101,7 @@ fn encode_dc_pf_instance(instance: &powerio_prob::DcPfInstance) -> Result<dto::D
 }
 
 fn encode_ac_pf_instance(instance: &powerio_prob::AcPfInstance) -> Result<dto::AcPfInstance> {
+    check_stored_hvdc(instance.network(), instance.hvdc_treatment())?;
     let network = with_component_ids(instance.network().clone());
     Ok(dto::AcPfInstance {
         initial_point: instance

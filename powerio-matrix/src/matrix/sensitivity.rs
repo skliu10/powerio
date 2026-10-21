@@ -935,6 +935,10 @@ impl<'a> Probe<'a> {
     /// `‖x̂ − x‖∞ / ‖x‖∞` within [`FORWARD_ERROR_TRUST`].
     fn trusts(&self, factor: &SparseFactor) -> bool {
         let n = self.b.len();
+        // All buses may be references: the empty grounded system is solved.
+        if n == 0 {
+            return true;
+        }
         let mut rhs = faer::Mat::<f64>::from_fn(n, 1, |i, _| self.b[i]);
         factor.solve_block(rhs.as_mut());
         let x: Vec<f64> = (0..n).map(|i| rhs[(i, 0)]).collect();

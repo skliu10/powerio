@@ -139,6 +139,27 @@ fn a_dc_pf_instance_that_ignores_injecting_hvdc_is_refused_rather_than_changed()
 }
 
 #[test]
+fn an_ac_pf_instance_that_ignores_injecting_hvdc_is_refused_rather_than_changed() {
+    let mut net = network();
+    let mut line = powerio_tx::Hvdc::new(BusId(1), BusId(2));
+    line.pf = 100.0;
+    line.pt = 97.0;
+    net.hvdc_mut().push(line);
+    for in_service in [true, false] {
+        net.hvdc_mut()[0].in_service = in_service;
+        let ignored =
+            AcPfInstance::from_network_with_hvdc(net.clone(), powerio_tx::HvdcTreatment::Ignore)
+                .unwrap();
+        let stored = serialize(&PioModule::new(PioValue::AcPfInstance(ignored)));
+        if in_service {
+            assert!(stored.unwrap_err().to_string().contains("HVDC"));
+        } else {
+            stored.unwrap();
+        }
+    }
+}
+
+#[test]
 fn every_instance_kind_round_trips() {
     let net = network();
     let objective = Objective::default().with_term(ObjectiveTerm::NetworkGeneratorCost);

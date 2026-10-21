@@ -531,3 +531,41 @@ fn top_k_bounds_the_ranked_list() {
         calc_stated_state_mismatch(&net, &StatedStateOptions::default().with_top_k(1)).unwrap();
     assert_eq!(mismatch.top, [row_of(&mismatch, 3)]);
 }
+
+#[test]
+fn the_maximum_mismatch_does_not_depend_on_report_length() {
+    let net = skeleton();
+    let full = calc_stated_state_mismatch(&net, &StatedStateOptions::default()).unwrap();
+    let empty =
+        calc_stated_state_mismatch(&net, &StatedStateOptions::default().with_top_k(0)).unwrap();
+    assert!(empty.top.is_empty());
+    assert!(full.calc_max_magnitude_mva() > 1.0);
+    assert!((empty.calc_max_magnitude_mva() - full.calc_max_magnitude_mva()).abs() < 1e-12);
+}
+
+#[test]
+fn closed_switches_require_merging_before_stated_balance() {
+    let mut net = BalancedNetwork::in_memory(
+        "switch",
+        BASE_MVA,
+        vec![
+            Bus::new(BusId(1), BusType::Ref, 230.0),
+            Bus::new(BusId(2), BusType::Pq, 230.0),
+        ],
+        vec![],
+    );
+    let mut generator = Generator::new(BusId(1));
+    generator.pg = 100.0;
+    net.generators_mut().push(generator);
+    net.loads_mut().push(Load::new(BusId(2), 100.0, 0.0));
+    net.switches_mut()
+        .push(powerio_tx::Switch::new(BusId(1), BusId(2), true));
+    let error = calc_stated_state_mismatch(&net, &StatedStateOptions::default()).unwrap_err();
+    assert!(error.to_string().contains("closed switch"), "{error}");
+    let merged = net.merge_buses(&powerio_tx::BusMergeRule::exact()).unwrap();
+    let result =
+        calc_stated_state_mismatch(&merged.network, &StatedStateOptions::default()).unwrap();
+    assert!(result.calc_max_magnitude_mva() < 1e-12);
+    net.switches_mut()[0].closed = false;
+    calc_stated_state_mismatch(&net, &StatedStateOptions::default()).unwrap();
+}

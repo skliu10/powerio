@@ -288,9 +288,11 @@ impl StatedStateMismatch {
     /// The largest `|ΔS|` of any bus in an island, MVA.
     #[must_use]
     pub fn calc_max_magnitude_mva(&self) -> f64 {
-        self.top
-            .first()
-            .map_or(0.0, |&row| self.buses[row].calc_magnitude_mva())
+        self.buses
+            .iter()
+            .filter(|bus| bus.island.is_some())
+            .map(StatedBusMismatch::calc_magnitude_mva)
+            .fold(0.0, f64::max)
     }
 
     /// The fixed injections that close the mismatch at every bus in an island
@@ -512,6 +514,7 @@ pub fn calc_stated_state_mismatch(
 ) -> Result<StatedStateMismatch> {
     net.check_base_mva()?;
     let view = IndexedNetwork::new(net);
+    view.check_closed_switches()?;
     let n = view.n();
     let base = view.per_unit_base();
     let base_mva = view.base_mva();

@@ -1265,7 +1265,9 @@ fn write_psse_rev_inner(
         // it, so the total is divided by the referral the reader applies
         // (see `unrefer_magnetizing`).
         let charging = br.calc_terminal_charging();
-        let referral = magnetizing_referral(br.calc_effective_tap());
+        let referral = extra_f64(&br.extras, "psse_magnetizing_referral")
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or_else(|| magnetizing_referral(br.calc_effective_tap()));
         let raw_name = br.name.as_deref().unwrap_or("");
         let name = sanitize_quoted(raw_name, NAME_FORBIDDEN, ' ');
         if matches!(name, std::borrow::Cow::Owned(_)) {
@@ -5458,6 +5460,10 @@ fn read_transformer(
     let referral = magnetizing_referral(tap);
     let (mag_g, mag_b) = (mag_g * referral, mag_b * referral);
     let mut extras = device_extras(l1, 3);
+    // MAG is fixed at bus I. Preserve the referral for consumers moving taps.
+    if mag_g != 0.0 || mag_b != 0.0 {
+        extras.insert("psse_magnetizing_referral".into(), Value::from(referral));
+    }
     retain_transformer_main_extras(&mut extras, l1, raw_rev)?;
     retain_transformer_winding_extras(&mut extras, l3, raw_rev, "")?;
     Ok((
@@ -7137,13 +7143,12 @@ Q
                 .unwrap(),
             0.0001,
         );
-        assert!(
-            warnings
-                .lines()
-                .iter()
-                .any(|line| line.contains("FACTS DEVICE section (1 record line(s))")),
-            "the FACTS record is one skipped record: {warnings:?}"
-        );
+        let [facts] = net.static_var_compensators().as_slice() else {
+            panic!("the quoted FACTS record must be parsed");
+        };
+        assert_eq!(facts.extras["psse_name"].as_str(), Some("FACTS 1"));
+        assert_eq!(facts.bus, BusId(3));
+        close(facts.voltage_setpoint_kv, 69.0);
 
         // A name holding a double quote is written single quoted and reads
         // back unchanged.
@@ -9152,11 +9157,24 @@ Q
         assert!((0.0019 * tap_squared / tap_squared - 0.0019).abs() > 0.0);
         let net = parse_psse(raw).unwrap();
         let charging = net.branches()[0].calc_terminal_charging();
+        // Consumers that move the tap must recover the fixed bus-I shunt.
+        close(
+            net.branches()[0].extras["psse_magnetizing_referral"]
+                .as_f64()
+                .unwrap(),
+            tap_squared,
+        );
         for rev in [33, 34, 35] {
             let written = write_psse_rev(&net, rev).text;
             let main = &section_records(&written, "TRANSFORMER")[0];
             assert_eq!(main[7..9], ["0.0019", "-0.0151"], "revision {rev}");
             let back = parse_psse(&written).unwrap();
+            close(
+                back.branches()[0].extras["psse_magnetizing_referral"]
+                    .as_f64()
+                    .unwrap(),
+                tap_squared,
+            );
             assert_eq!(
                 back.branches()[0].calc_terminal_charging(),
                 charging,
@@ -9172,6 +9190,13 @@ Q
             table["data"][0][index].as_f64().unwrap()
         };
         assert_eq!((column("mag1"), column("mag2")), (0.0019, -0.0151));
+        let mut moved = net.clone();
+        moved.branches_mut()[0].tap = 1.1;
+        let written = write_psse(&moved).text;
+        let back = parse_psse(&written).unwrap();
+        let shunt = back.branches()[0].calc_terminal_charging();
+        close(shunt.g_fr / 1.1_f64.powi(2), 0.0019);
+        close(shunt.b_fr / 1.1_f64.powi(2), -0.0151);
     }
 
     #[test]
@@ -9905,11 +9930,11 @@ COMMENT
 0 / END OF TRANSFORMER DATA, BEGIN AREA DATA
 0 / END OF AREA DATA, BEGIN TWO-TERMINAL DC DATA
 0 / END OF TWO-TERMINAL DC DATA, BEGIN VSC DC LINE DATA
-0 / END OF VSC DC LINE DATA, BEGIN IMPEDANCE CORRECTION DATA
+0 / END OF VSC DC LINE DATA, BEGIN MULTI-TERMINAL DC DATA
 1, -30.0, 1.1
 2, 0.0, 1.0
 0
-0 / END OF IMPEDANCE CORRECTION DATA, BEGIN MULTI-TERMINAL DC DATA
+0 / END OF MULTI-TERMINAL DC DATA, BEGIN MULTI-SECTION LINE DATA
 Q
 ";
         let mut warnings = Diagnostics::new();
@@ -9918,7 +9943,7 @@ Q
             warnings
                 .lines()
                 .iter()
-                .any(|w| w.contains("IMPEDANCE CORRECTION section (2 record line(s))")),
+                .any(|w| w.contains("MULTI-TERMINAL DC section (2 record line(s))")),
             "bare terminator should not be counted as skipped data: {warnings:?}"
         );
     }

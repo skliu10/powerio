@@ -1224,16 +1224,16 @@ fn verify_stated_state_refuses_then_merges_a_zero_impedance_branch() {
         "{records:?}"
     );
 
-    let merged = run(&["verify", path, "--stated-state", "--merge-zero-impedance"]);
-    assert!(
-        merged.status.success(),
-        "{}",
-        String::from_utf8_lossy(&merged.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&merged.stdout);
-    assert!(stdout.contains("1 buses in 1 islands"), "{stdout}");
-    assert!(stdout.contains("max |dS| = 0.000 MVA"), "{stdout}");
-    assert!(stdout.contains("merged_group"), "{stdout}");
+    for flags in [&["--merge-zero-impedance"][..], &["--merge-buses", "exact"]] {
+        let mut args = vec!["verify", path, "--stated-state"];
+        args.extend_from_slice(flags);
+        let merged = run(&args);
+        assert_success(&merged);
+        let stdout = String::from_utf8_lossy(&merged.stdout);
+        assert!(stdout.contains("1 buses in 1 islands"), "{stdout}");
+        assert!(stdout.contains("max |dS| = 0.000 MVA"), "{stdout}");
+        assert!(stdout.contains("merged_group"), "{stdout}");
+    }
 
     std::fs::remove_file(case).unwrap();
 }
