@@ -1103,6 +1103,7 @@ pub(crate) fn emit_value_text(net: &BalancedNetwork, format: TargetFormat) -> Re
                 });
             }
             net.check_base_mva()?;
+            psse::validate_impedance_correction_emission(net, rev)?;
             write_psse_rev(net, rev)
         }
         TargetFormat::PsseRawx => {

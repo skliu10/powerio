@@ -1105,11 +1105,16 @@ fn transmission_targets() -> impl Iterator<Item = (usize, TransmissionFormat)> {
 //   their electrical equipment row. Missing PSS/E node numbers are allocated
 //   before exact regulation targets are written, and that target requirement
 //   produces one grouped default diagnostic.
+// Retaining PSS/E's separate bus-base winding-2 ratio adds one EXTRAS_DROPPED
+// diagnostic on RAW33/RAWX35/RAW32 -> MATPOWER, PowerWorld, PSLF, and UCTE.
+// RAW33/RAWX35 -> GridFM adds one FIELD_DROPPED for three branch rows' extras.
+// These targets do not retain `psse_winding2_ratio`; the electrical survival
+// checks are unchanged. Derived with the per-pair warning detail cap lifted.
 const TRANSMISSION_WARNING_BASELINE: [[usize; TRANSMISSION_TARGETS]; 19] = [
     [0, 1, 15, 15, 18, 7, 14, 23, 14, 70, 70, 57, 42, 15, 31], // MATPOWER .m
     [0, 0, 15, 15, 17, 6, 13, 22, 13, 69, 69, 56, 41, 14, 30], // PowerModels JSON
-    [1, 1, 0, 0, 2, 1, 3, 1, 2, 32, 32, 12, 29, 9, 28],        // PSS/E .raw 33
-    [1, 1, 0, 0, 2, 1, 3, 1, 2, 32, 32, 12, 29, 9, 28],        // PSS/E RAWX 35
+    [2, 1, 0, 0, 3, 1, 3, 1, 3, 32, 32, 12, 30, 9, 29],        // PSS/E .raw 33
+    [2, 1, 0, 0, 3, 1, 3, 1, 3, 32, 32, 12, 30, 9, 29],        // PSS/E RAWX 35
     [1, 0, 6, 6, 0, 0, 8, 0, 6, 54, 54, 30, 33, 13, 27],       // PowerWorld .aux
     [0, 0, 9, 9, 12, 0, 7, 1, 7, 68, 68, 36, 36, 9, 25],       // egret JSON
     [0, 0, 7, 7, 8, 0, 0, 0, 7, 55, 55, 35, 52, 8, 18],        // pandapower JSON
@@ -1121,7 +1126,7 @@ const TRANSMISSION_WARNING_BASELINE: [[usize; TRANSMISSION_TARGETS]; 19] = [
     [18, 12, 6, 6, 18, 12, 6, 12, 18, 36, 36, 12, 0, 12, 36],  // UCTE-DEF .uct
     [0, 6, 14, 14, 14, 6, 9, 6, 12, 70, 70, 38, 38, 0, 15],    // PyPSA CSV
     [6, 0, 14, 14, 14, 6, 9, 0, 12, 64, 64, 32, 40, 12, 0],    // GridFM Parquet
-    [5, 4, 2, 2, 4, 4, 5, 4, 6, 14, 14, 9, 10, 6, 12],         // PSS/E .raw 32
+    [6, 4, 2, 2, 5, 4, 5, 4, 7, 14, 14, 9, 11, 6, 12],         // PSS/E .raw 32
     [8, 8, 6, 6, 8, 8, 9, 8, 8, 13, 13, 8, 14, 9, 11],         // IEEE CDF
     [6, 5, 7, 7, 9, 5, 7, 5, 7, 8, 8, 7, 14, 9, 11],           // GO Challenge 3 JSON
     [3, 2, 5, 5, 5, 3, 4, 2, 4, 32, 32, 8, 32, 5, 4],          // DeepMind OPFData JSON

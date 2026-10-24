@@ -242,8 +242,7 @@ struct WrittenImpedanceTables {
     tables: BTreeMap<u32, Vec<ImpedanceCorrectionPoint>>,
     /// Two winding transformer rows in the branch table.
     branches: BTreeMap<usize, u32>,
-    /// Noncanonical winding-2 ratios needed to preserve a ratio table's
-    /// classification after converting branch-tap coordinates back to RAW.
+    /// Winding-2 ratios used to convert branch-tap coordinates back to RAW.
     branch_ratio2: BTreeMap<usize, f64>,
     /// Three winding transformer rows and windings.
     windings: BTreeMap<(usize, usize), u32>,
@@ -259,21 +258,7 @@ fn assign_impedance_tables(
     rev: u32,
     warnings: &mut Diagnostics,
 ) -> WrittenImpedanceTables {
-    let mut corrections = Vec::new();
-    for (row, branch) in net.branches().iter().enumerate() {
-        if branch.is_transformer()
-            && let Some(correction) = branch.impedance_correction()
-        {
-            corrections.push((ImpedanceTarget::Branch(row), correction));
-        }
-    }
-    for (row, transformer) in net.transformers_3w().iter().enumerate() {
-        for winding in 0..3 {
-            if let Some(correction) = transformer.winding_impedance_correction(winding) {
-                corrections.push((ImpedanceTarget::Winding(row, winding), correction));
-            }
-        }
-    }
+    let corrections = impedance_correction_targets(net);
     let mut written = WrittenImpedanceTables::default();
     let mut next_free = corrections
         .iter()
@@ -312,14 +297,10 @@ fn assign_impedance_tables(
                     written.tables.insert(table, correction.points.clone());
                     table
                 };
-                warnings.push(
-                    &F.value_substituted,
-                    format!(
-                        "impedance correction table {} states different per unit points for {}; written as table {table}",
-                        correction.table,
-                        impedance_target_label(net, target)
-                    ),
-                );
+                warnings.push(&F.value_substituted, format!(
+                    "impedance correction table {} states different per unit points for {}; written as table {table}",
+                    correction.table, impedance_target_label(net, target)
+                ));
                 table
             }
         };
@@ -335,6 +316,71 @@ fn assign_impedance_tables(
     written
 }
 
+fn impedance_correction_targets(
+    net: &BalancedNetwork,
+) -> Vec<(ImpedanceTarget, ImpedanceCorrection)> {
+    let mut corrections = Vec::new();
+    for (row, branch) in net.branches().iter().enumerate() {
+        if branch.is_transformer()
+            && let Some(correction) = branch.impedance_correction()
+        {
+            corrections.push((ImpedanceTarget::Branch(row), correction));
+        }
+    }
+    for (row, transformer) in net.transformers_3w().iter().enumerate() {
+        for winding in 0..3 {
+            if let Some(correction) = transformer.winding_impedance_correction(winding) {
+                corrections.push((ImpedanceTarget::Winding(row, winding), correction));
+            }
+        }
+    }
+    corrections
+}
+
+/// Refuse canonical output that the corresponding RAW reader cannot consume.
+pub(super) fn validate_impedance_correction_emission(
+    net: &BalancedNetwork,
+    rev: u32,
+) -> Result<()> {
+    let corrections = impedance_correction_targets(net);
+    let max_points = if rev < 34 { 11 } else { 99 };
+    for (target, mut correction) in corrections {
+        if rev < 35
+            && let ImpedanceTarget::Winding(row, _) = target
+            && extra_i64(&net.transformers_3w()[row].extras, "psse_zcod") == Some(1)
+        {
+            // Older revisions freeze ZCOD=1 before writing any of its tables.
+            continue;
+        }
+        if correction.points.len() > max_points {
+            return Err(Error::Emit {
+                format: FMT,
+                message: format!(
+                    "PSS/E impedance correction table {} must contain 2–{max_points} points",
+                    correction.table
+                ),
+            });
+        }
+        if prepare_impedance_points(&mut correction, target, rev, net, &mut Diagnostics::new())
+            .is_none()
+        {
+            continue;
+        }
+        if rev < 34 {
+            for point in &mut correction.points {
+                point.factor_im = 0.0;
+            }
+        }
+        validate_impedance_points(correction.table, &correction.points, 2, max_points).map_err(
+            |error| Error::Emit {
+                format: FMT,
+                message: error.to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Map a neutral correction to RAW table coordinates without changing its
 /// ratio/angle classification. Returns the winding-2 ratio to emit, or none
 /// when the table cannot be represented and was reported.
@@ -345,10 +391,28 @@ fn prepare_impedance_points(
     net: &BalancedNetwork,
     warnings: &mut Diagnostics,
 ) -> Option<f64> {
-    let mut ratio2 = 1.0;
+    let mut ratio2 = match target {
+        ImpedanceTarget::Branch(row) => winding2_ratio(&net.branches()[row]),
+        ImpedanceTarget::Winding(..) => 1.0,
+    };
+    if correction.variable == ImpedanceCorrectionVariable::Ratio {
+        for point in &mut correction.points {
+            point.value *= ratio2;
+        }
+    }
     correction
         .points
         .sort_by(|a, b| a.value.total_cmp(&b.value));
+    if let [point] = correction.points.as_slice() {
+        // A singleton describes a constant function; RAW requires two points.
+        let coordinates = match correction.variable {
+            ImpedanceCorrectionVariable::Ratio => [0.5, 1.5],
+            ImpedanceCorrectionVariable::Angle => [-1.0, 1.0],
+        };
+        correction.points = coordinates
+            .map(|value| ImpedanceCorrectionPoint::new(value, point.factor_re, point.factor_im))
+            .to_vec();
+    }
     if correction.variable == ImpedanceCorrectionVariable::Ratio
         && impedance_table_variable(&correction.points) != ImpedanceCorrectionVariable::Ratio
     {
@@ -360,9 +424,10 @@ fn prepare_impedance_points(
             // Keeping WINDV2=1 would turn this ratio table into an angle
             // table. Choose an equivalent pair of ratios and undo the
             // t2² impedance referral when emitting the transformer.
-            ratio2 = 2.0 / (first.value + last.value);
+            let scale = 2.0 / (first.value + last.value);
+            ratio2 *= scale;
             for point in &mut correction.points {
-                point.value = (point.value * ratio2).clamp(0.5, 1.5);
+                point.value = (point.value * scale).clamp(0.5, 1.5);
             }
         } else {
             warnings.push(&F.field_dropped, format!(
@@ -393,6 +458,12 @@ fn prepare_impedance_points(
         );
     }
     Some(ratio2)
+}
+
+fn winding2_ratio(branch: &Branch) -> f64 {
+    extra_f64(&branch.extras, "psse_winding2_ratio")
+        .filter(|ratio| ratio.is_finite() && ratio.abs() > f64::EPSILON)
+        .unwrap_or(1.0)
 }
 
 fn impedance_target_label(net: &BalancedNetwork, target: ImpedanceTarget) -> String {
@@ -1348,7 +1419,7 @@ fn write_psse_rev_inner(
             .branch_ratio2
             .get(&branch_index)
             .copied()
-            .unwrap_or(1.0);
+            .unwrap_or_else(|| winding2_ratio(br));
         let (mut rma, mut rmi, vma, vmi, ntp) = ctl.map_or((1.1, 0.9, 1.1, 0.9, 33), |c| {
             (c.tap_max, c.tap_min, c.band_max, c.band_min, c.ntp)
         });
@@ -3213,17 +3284,7 @@ fn parse_psse_source_inner(
                         "psse_tab",
                         // Tables always use bus-base per-unit winding ratios,
                         // independently of CW. The branch uses t1 / t2.
-                        1.0 / two_winding_tap(
-                            &f,
-                            &f3,
-                            &f4,
-                            transformer.from,
-                            transformer.to,
-                            transformer_basis_codes(&f)?.0,
-                            &bus_base_kv,
-                            &mut Diagnostics::new(),
-                        )?
-                        .1,
+                        1.0 / winding2_ratio(&transformer),
                     ) {
                         impedance_references.push(reference);
                     }
@@ -3360,12 +3421,7 @@ fn parse_psse_source_inner(
                 {
                     slot.insert(points);
                 } else {
-                    warnings.push(
-                        &codes::READ_PSSE_VALUE_SUBSTITUTED,
-                        format!(
-                            "PSS/E impedance correction table {table} is stated twice; kept the first"
-                        ),
-                    );
+                    return Err(impedance_table_error(table, "is stated twice"));
                 }
             }
             Section::Facts => {
@@ -3404,7 +3460,7 @@ fn parse_psse_source_inner(
         &mut branches,
         &mut transformers_3w,
         warnings,
-    );
+    )?;
     if series_facts > 0 {
         warnings.push(
             &codes::READ_PSSE_SECTION_UNSUPPORTED,
@@ -5460,6 +5516,8 @@ fn read_transformer(
     let referral = magnetizing_referral(tap);
     let (mag_g, mag_b) = (mag_g * referral, mag_b * referral);
     let mut extras = device_extras(l1, 3);
+    // Bus-base p.u.; needed to recover the separate winding ratios from t1/t2.
+    extras.insert("psse_winding2_ratio".into(), Value::from(ratio2));
     // MAG is fixed at bus I. Preserve the referral for consumers moving taps.
     if mag_g != 0.0 || mag_b != 0.0 {
         extras.insert("psse_magnetizing_referral".into(), Value::from(referral));
@@ -5879,6 +5937,12 @@ fn read_impedance_correction(
         format: FMT,
         message: "impedance correction table number exceeds the u32 range".into(),
     })?;
+    if table == 0 {
+        return Err(impedance_table_error(
+            table,
+            "must have a positive table number",
+        ));
+    }
     let numbers = |fields: &[Cow<'_, str>], start: usize| {
         (start..fields.len())
             .map(|i| finite_field(i, &fields[i]))
@@ -5886,33 +5950,102 @@ fn read_impedance_correction(
     };
     let mut points = Vec::new();
     if raw_rev < 34 {
-        for &[value, factor] in numbers(f, 1)?.as_chunks::<2>().0 {
+        let values = numbers(f, 1)?;
+        let (pairs, remainder) = values.as_chunks::<2>();
+        if !remainder.is_empty() {
+            return Err(impedance_table_error(table, "has an incomplete T, F pair"));
+        }
+        let mut padding = false;
+        for &[value, factor] in pairs {
             if value != 0.0 || factor != 0.0 {
+                if padding {
+                    return Err(impedance_table_error(
+                        table,
+                        "has points after its zero padding",
+                    ));
+                }
                 points.push(ImpedanceCorrectionPoint::new(value, factor, 0.0));
+            } else {
+                padding = true;
             }
         }
+        validate_impedance_points(table, &points, 1, 11)?;
         return Ok((table, points));
     }
     let mut values = numbers(f, 1)?;
     loop {
-        for &[value, factor_re, factor_im] in values.as_chunks::<3>().0 {
+        let (triples, remainder) = values.as_chunks::<3>();
+        if !remainder.is_empty() {
+            return Err(impedance_table_error(
+                table,
+                "has an incomplete T, Re(F), Im(F) point",
+            ));
+        }
+        for (index, &[value, factor_re, factor_im]) in triples.iter().enumerate() {
             if value == 0.0 && factor_re == 0.0 && factor_im == 0.0 {
+                if triples[index + 1..]
+                    .iter()
+                    .flatten()
+                    .any(|value| *value != 0.0)
+                {
+                    return Err(impedance_table_error(
+                        table,
+                        "has points after its zero terminator",
+                    ));
+                }
+                validate_impedance_points(table, &points, 1, 99)?;
                 return Ok((table, points));
             }
             points.push(ImpedanceCorrectionPoint::new(value, factor_re, factor_im));
         }
+        if points.len() > 99 {
+            return Err(impedance_table_error(table, "has more than 99 points"));
+        }
         let Some(line) = next_open_continuation_line(lines, warnings) else {
-            warnings.push(
-                &codes::READ_PSSE_VALUE_SUBSTITUTED,
-                format!(
-                    "PSS/E impedance correction table {table} ends without its 0.0, 0.0, 0.0 point; read the {} point(s) it states",
-                    points.len()
-                ),
-            );
-            return Ok((table, points));
+            return Err(impedance_table_error(
+                table,
+                "ends without its 0.0, 0.0, 0.0 point",
+            ));
         };
         values = numbers(&fields(line), 0)?;
     }
+}
+
+fn impedance_table_error(table: u32, reason: &str) -> Error {
+    Error::FormatRead {
+        format: FMT,
+        message: format!("PSS/E impedance correction table {table} {reason}"),
+    }
+}
+
+/// PSS/E 35.4.1 Data Formats §1.18.1 requires ordered, nonzero factors.
+/// Existing source files also use singleton constants; fresh output expands
+/// them to the two equivalent points required by the format specification.
+fn validate_impedance_points(
+    table: u32,
+    points: &[ImpedanceCorrectionPoint],
+    min_points: usize,
+    max_points: usize,
+) -> Result<()> {
+    if !(min_points..=max_points).contains(&points.len()) {
+        return Err(impedance_table_error(
+            table,
+            &format!("must contain {min_points}–{max_points} points"),
+        ));
+    }
+    if points
+        .iter()
+        .any(|point| point.factor_re == 0.0 && point.factor_im == 0.0)
+    {
+        return Err(impedance_table_error(table, "has a zero scaling factor"));
+    }
+    if points.windows(2).any(|pair| pair[0].value >= pair[1].value) {
+        return Err(impedance_table_error(
+            table,
+            "coordinates must be strictly ascending",
+        ));
+    }
+    Ok(())
 }
 
 /// The next data line of a record whose end the record itself states, or
@@ -5928,7 +6061,7 @@ fn next_open_continuation_line<'a>(
         if line.is_empty() || is_comment(line) {
             continue;
         }
-        if line.eq_ignore_ascii_case("q") || is_terminator(line) {
+        if line.eq_ignore_ascii_case("q") || (is_terminator(line) && fields(line).len() == 1) {
             return None;
         }
         *lines = ahead;
@@ -5948,7 +6081,7 @@ fn attach_impedance_corrections(
     branches: &mut [Branch],
     transformers_3w: &mut [Transformer3W],
     warnings: &mut Diagnostics,
-) {
+) -> Result<()> {
     let mut named = BTreeSet::new();
     let mut missing = BTreeSet::new();
     for reference in references {
@@ -5980,13 +6113,17 @@ fn attach_impedance_corrections(
         }
     }
     if !missing.is_empty() {
-        warnings.push(
-            &codes::READ_PSSE_REFERENCE_DROPPED,
-            format!(
-                "PSS/E transformer windings name impedance correction table(s) {} that the case does not state; their impedance is read uncorrected",
-                missing.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+        return Err(Error::FormatRead {
+            format: FMT,
+            message: format!(
+                "PSS/E transformer windings name impedance correction table(s) {} that the case does not state",
+                missing
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
-        );
+        });
     }
     let unnamed = tables
         .keys()
@@ -6000,6 +6137,7 @@ fn attach_impedance_corrections(
             ),
         );
     }
+    Ok(())
 }
 
 /// Read a 3-line two-terminal DC line record into an [`Hvdc`].
@@ -7902,16 +8040,15 @@ Q
                 crate::format::emit_text(&module, crate::TargetFormat::Psse { rev: 33 }).unwrap();
             assert_eq!(echo.text, text, "CW {cw}: the same format write echoes");
 
-            // The canonical write states the same circuit with winding 2 at
-            // one, so a read of it scales nothing, and a second write and read
-            // leave the branch where the first left it.
+            // Fresh writing preserves the separate winding ratio as well as
+            // the circuit; repeated write/read must not compound its referral.
             let written = write_psse(&parse_psse(&text).unwrap()).text;
             let winding2 = written
                 .lines()
                 .skip_while(|line| !line.contains("BEGIN TRANSFORMER DATA"))
                 .nth(4)
                 .unwrap();
-            assert!(winding2.starts_with("1.0, "), "CW {cw}: {winding2}");
+            close(fields(winding2)[0].parse().unwrap(), t2);
             let back = parse_psse(&written).unwrap().branches()[0].clone();
             let again = parse_psse(&write_psse(&parse_psse(&written).unwrap()).text)
                 .unwrap()
@@ -7924,6 +8061,8 @@ Q
                 (again.r, br.r),
                 (again.x, br.x),
                 (again.tap, br.tap),
+                (winding2_ratio(&back), t2),
+                (winding2_ratio(&again), t2),
             ] {
                 assert!((a - b).abs() < 1e-12, "CW {cw}: {a} != {b}");
             }
@@ -8291,6 +8430,9 @@ COMMENT
 1.0, 0.0
 0 / END OF TRANSFORMER DATA, BEGIN AREA DATA
 1, 1, 0.0, 0.0, 'AREA        '
+0 / END OF AREA DATA, BEGIN IMPEDANCE CORRECTION DATA
+9, 0.9, 1.0, 0.0, 1.1, 1.0, 0.0, 0.0, 0.0, 0.0
+0 / END OF IMPEDANCE CORRECTION DATA
 Q
 ";
         let mut warnings = Diagnostics::new();
@@ -8298,13 +8440,8 @@ Q
         let findings = warnings.lines();
         assert_eq!(
             findings.len(),
-            1,
+            0,
             "a NOD of 0 names no regulating node: {findings:?}"
-        );
-        assert!(
-            findings[0].contains("READ.PSSE.REFERENCE_DROPPED")
-                && findings[0].contains("table(s) 9"),
-            "{findings:?}"
         );
         assert_eq!(net.branches().len(), 1, "K = 0.00 is a 2-winding record");
         assert_eq!(net.transformers_3w().as_slice(), []);
@@ -8381,6 +8518,9 @@ COMMENT
 1.0, 230.0, 10.0, 200, 200, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 30.0, -30.0, 60.0, 40.0, 33, 1, 0.0, 0.0, 0.0, 7
 1.0, 115.0
 0 / END OF TRANSFORMER DATA, BEGIN AREA DATA
+0 / END OF AREA DATA, BEGIN IMPEDANCE CORRECTION DATA
+1, -30.0, 1.0, 0.0, 30.0, 1.0, 0.0, 0.0, 0.0, 0.0
+0 / END OF IMPEDANCE CORRECTION DATA
 Q
 ";
         let mut warnings = Diagnostics::new();
@@ -8407,10 +8547,10 @@ Q
         assert_eq!(control.winding_connection_angle, None, "CNXA is 0.0");
         assert_eq!(angle.extras["psse_tab"], Value::from(1));
 
-        // The case omits both table 1 and substation data for node 7.
+        // The case omits substation data for node 7.
         // A node read from RMA (1 or 30) would still name the wrong node.
         let lines = warnings.lines();
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines
                 .iter()
@@ -8419,10 +8559,6 @@ Q
         );
         assert!(
             lines.iter().any(|line| line.contains("node 7 ")),
-            "{lines:?}"
-        );
-        assert!(
-            lines.iter().any(|line| line.contains("table(s) 1")),
             "{lines:?}"
         );
     }
@@ -11777,8 +11913,8 @@ Q
     /// A (1-2) controls active power flow at -20 degrees and B (2-4) states a
     /// fixed 30 degree shift, both on angle table 1; C (2-3) controls voltage
     /// at ratio 1.05 on ratio table 2; D (1-4) states its ratio in kV (CW 2)
-    /// on table 4, which still states per-unit ratios; E (3-4) names table 9, which the case does
-    /// not state; the three winding transformer names table 2 on winding 3 at
+    /// on table 4, which still states per-unit ratios; E (3-4) has no table;
+    /// the three winding transformer names table 2 on winding 3 at
     /// ratio 0.95. Table 1 spans two lines and has a point at 0 degrees, and
     /// table 3 is named by no transformer.
     fn impedance_correction_case() -> String {
@@ -11807,7 +11943,7 @@ Q
             "230.0, 230.0".to_owned(),
             main(3, 4, 0, 1, "E"),
             "0.02, 0.2, 100.0".to_owned(),
-            w(1.0, 0.0, 0.0, 0, 0, 9),
+            w(1.0, 0.0, 0.0, 0, 0, 0),
             "1.0, 0.0".to_owned(),
             main(1, 3, 5, 1, "T3W"),
             "0.01, 0.1, 100.0, 0.02, 0.2, 100.0, 0.03, 0.3, 100.0, 1.0, 0.0".to_owned(),
@@ -11840,7 +11976,7 @@ COMMENT
 1, -60.0, 1.5, 0.1, -30.0, 1.2, 0.0, 0.0, 1.0, 0.0
    30.0, 1.2, 0.0, 60.0, 1.5, -0.1, 0.0, 0.0, 0.0
 2, 0.9, 1.1, 0.0, 1.0, 1.0, 0.0, 1.1, 1.05, 0.0, 0.0, 0.0, 0.0
-3, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0
+3, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0
 4, 0.9, 1.1, 0.0, 1.0, 1.0, 0.0, 1.1, 1.05, 0.0, 0.0, 0.0, 0.0
 0 / END OF IMPEDANCE CORRECTION DATA, BEGIN MULTI-TERMINAL DC DATA
 Q
@@ -11912,13 +12048,6 @@ Q
         }
         assert_eq!((dangling, winding1, winding2), (&None, &None, &None));
         let lines = warnings.lines();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("READ.PSSE.REFERENCE_DROPPED")
-                    && line.contains("table(s) 9")),
-            "{lines:?}"
-        );
         assert!(
             lines.iter().any(|line| line
                 .contains("1 PSS/E impedance correction table(s) that no transformer names")),
@@ -12015,7 +12144,7 @@ Q
     /// branch tap is `t1 / t2` and the reader refers the impedance across
     /// `t2` by `t2²`. The factor PSS/E takes at `t1` multiplies the impedance
     /// it states; a complex factor commutes with the referral, so the
-    /// corrected branch is `t2² · F(t1) · Z`. A write states winding 2 at one
+    /// corrected branch is `t2² · F(t1) · Z`. A write preserves winding 2
     /// and reads back to the same tables, nominal impedance, and correction.
     #[test]
     #[allow(clippy::float_cmp)] // the round trip is exact, not approximate
@@ -12169,6 +12298,16 @@ Q
                 back.apply_impedance_correction();
                 close(back.branches()[3].r, net.branches()[3].r);
                 close(back.branches()[3].tap, net.branches()[3].tap);
+                close(winding2_ratio(&back.branches()[3]), 0.98);
+                for ratio in [0.85, 0.95, 1.0, 1.1, 1.2] {
+                    let mut moved = net.clone();
+                    moved.branches_mut()[3].tap = ratio / 0.98;
+                    back.branches_mut()[3].tap = ratio / 0.98;
+                    moved.apply_impedance_correction();
+                    back.apply_impedance_correction();
+                    close(back.branches()[3].r, moved.branches()[3].r);
+                    close(back.branches()[3].x, moved.branches()[3].x);
+                }
             }
         }
     }
@@ -12442,5 +12581,126 @@ Q
                     .contains("exactly one nonzero winding COD")
             );
         }
+    }
+
+    #[test]
+    fn impedance_correction_rejects_malformed_raw_tables() {
+        for (record, reason) in [
+            ("2, 0.0, 0.0, 0.0", "1–99"),
+            (
+                "2, 0.9, 0.0, 0.0, 1.1, 1.0, 0.0, 0.0, 0.0, 0.0",
+                "zero scaling",
+            ),
+            (
+                "2, 1.1, 1.0, 0.0, 0.9, 1.0, 0.0, 0.0, 0.0, 0.0",
+                "ascending",
+            ),
+            (
+                "2, 0.9, 1.0, 0.0, 0.9, 1.0, 0.0, 0.0, 0.0, 0.0",
+                "ascending",
+            ),
+            (
+                "2, 0.9, 1.0, 0.0, 1.1, NaN, 0.0, 0.0, 0.0, 0.0",
+                "not a finite number",
+            ),
+            ("2, 0.9, 1.0, 0.0, 1.1, 1.0, 0.0", "without"),
+            ("2, 0.9, 1.0, 0.0, 1.1, 1.0", "incomplete"),
+            (
+                "2, 0.9, 1.0, 0.0, 1.1, 1.0, 0.0, 0.0, 0.0, 0.0, 1.2, 1.0, 0.0",
+                "after its zero",
+            ),
+        ] {
+            let mut lines = RawLines::new("0 / END OF IMPEDANCE CORRECTION DATA\nQ\n");
+            let error =
+                read_impedance_correction(&fields(record), 35, &mut lines, &mut Diagnostics::new())
+                    .unwrap_err();
+            assert!(error.to_string().contains(reason), "{record}: {error}");
+        }
+        let mut lines = RawLines::new("");
+        assert!(
+            read_impedance_correction(
+                &fields("1, 0.9, 1.0, 1.1"),
+                33,
+                &mut lines,
+                &mut Diagnostics::new()
+            )
+            .is_err()
+        );
+
+        let raw = impedance_correction_case();
+        let record = "2, 0.9, 1.1, 0.0, 1.0, 1.0, 0.0, 1.1, 1.05, 0.0, 0.0, 0.0, 0.0";
+        let duplicate = raw.replace(record, &format!("{record}\n{record}"));
+        assert!(
+            parse_psse(&duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("stated twice")
+        );
+        let missing = correction_case_edit_transformer(&raw, "E", |lines| {
+            correction_set_field(&mut lines[2], 23, 9);
+        });
+        assert!(
+            parse_psse(&missing)
+                .unwrap_err()
+                .to_string()
+                .contains("table(s) 9")
+        );
+        for count in [99, 100] {
+            let points = (0..count)
+                .map(|index| format!("{index}, 1.0, 0.0"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let record = format!("2, {points}, 0.0, 0.0, 0.0");
+            let result = read_impedance_correction(
+                &fields(&record),
+                35,
+                &mut RawLines::new(""),
+                &mut Diagnostics::new(),
+            );
+            assert_eq!(result.is_ok(), count == 99);
+        }
+    }
+
+    #[test]
+    fn impedance_correction_star_expansion_preserves_independent_nominal_values() {
+        let mut native = parse_psse(&impedance_correction_case()).unwrap();
+        native.branches_mut().clear();
+        let uncorrected = native.expand_transformers_3w();
+        assert!(uncorrected.branches()[2].impedance_correction().is_some());
+        assert!(
+            !uncorrected.branches()[2]
+                .extras
+                .contains_key(IMPEDANCE_CORRECTION_NOMINAL_EXTRA)
+        );
+        native.apply_impedance_correction();
+        let mut lowered = native.expand_transformers_3w().into_owned();
+        assert!(
+            lowered.branches()[2]
+                .extras
+                .contains_key(IMPEDANCE_CORRECTION_NOMINAL_EXTRA)
+        );
+        for tap in [0.95, 1.0, 1.05, 1.2] {
+            native.transformers_3w_mut()[0].windings[2].tap = tap;
+            lowered.branches_mut()[2].tap = tap;
+            native.apply_impedance_correction();
+            lowered.apply_impedance_correction();
+            for (branch, (r, x)) in lowered
+                .branches()
+                .iter()
+                .zip(native.transformers_3w()[0].calc_star_impedances())
+            {
+                close(branch.r, r);
+                close(branch.x, x);
+            }
+        }
+        let mut coupled = parse_psse(&pairwise_correction_case(1, 0)).unwrap();
+        coupled.apply_impedance_correction();
+        let (_, branches) = coupled.transformers_3w()[0].to_star_expansion(BusId(99));
+        assert!(branches.iter().all(|branch| {
+            branch.impedance_correction().is_none()
+                && !branch
+                    .extras
+                    .contains_key(IMPEDANCE_CORRECTION_NOMINAL_EXTRA)
+        }));
     }
 }
