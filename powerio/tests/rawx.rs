@@ -1,3 +1,6 @@
+use powerio::network::{
+    ImpedanceCorrection, ImpedanceCorrectionPoint, ImpedanceCorrectionVariable,
+};
 use powerio::{
     Destination, EmittedOutput, FormatId, PioValue, Source, deserialize, emit, parse, serialize,
 };
@@ -37,6 +40,225 @@ fn memory_text(result: powerio::EmitResult) -> String {
         panic!("memory destination returned a path output");
     };
     String::from_utf8(artifacts.pop().unwrap().into_bytes()).unwrap()
+}
+
+fn network_with_correction(correction: ImpedanceCorrection) -> powerio::BalancedNetwork {
+    let module =
+        parse(Source::from_memory("case.rawx", RAWX.as_bytes().to_vec()).unwrap()).unwrap();
+    let PioValue::BalancedNetwork(network) = module.value() else {
+        panic!("balanced network expected")
+    };
+    let mut network = network.clone();
+    network.branches_mut()[0].tap = 1.05 / 0.98;
+    network.branches_mut()[0]
+        .extras
+        .insert("psse_winding2_ratio".into(), 0.98.into());
+    network.branches_mut()[0].set_impedance_correction(Some(correction));
+    network
+}
+
+#[test]
+fn single_point_correction_emits_an_equivalent_constant_table() {
+    for format in ["psse", "psse35", "psse-rawx"] {
+        for variable in [
+            ImpedanceCorrectionVariable::Ratio,
+            ImpedanceCorrectionVariable::Angle,
+        ] {
+            let imaginary = if format == "psse" { 0.0 } else { 0.1 };
+            let mut network = network_with_correction(ImpedanceCorrection::new(
+                7,
+                variable,
+                vec![ImpedanceCorrectionPoint::new(0.8, 1.2, imaginary)],
+            ));
+            network.apply_impedance_correction();
+            let expected = (network.branches()[0].r, network.branches()[0].x);
+            let module = powerio::PioModule::new(PioValue::BalancedNetwork(network));
+            let text =
+                memory_text(emit(&module, format, Destination::memory("fresh").unwrap()).unwrap());
+            let restored = parse(
+                Source::from_memory("fresh", text.into_bytes())
+                    .unwrap()
+                    .with_format(FormatId::new(format).unwrap()),
+            )
+            .unwrap();
+            let PioValue::BalancedNetwork(back) = restored.value() else {
+                panic!("balanced network expected")
+            };
+            let correction = back.branches()[0].impedance_correction().unwrap();
+            assert_eq!(correction.variable, variable);
+            assert_eq!(correction.points.len(), 2);
+            for at in [-60.0, 0.5, 0.8, 1.0, 1.5, 60.0] {
+                assert_eq!(correction.calc_factor(at), Some((1.2, imaginary)));
+            }
+            let mut back = back.clone();
+            back.apply_impedance_correction();
+            assert!((back.branches()[0].r - expected.0).abs() < 1e-12);
+            assert!((back.branches()[0].x - expected.1).abs() < 1e-12);
+        }
+    }
+}
+
+#[test]
+fn singleton_source_corrections_preserve_the_constant_case_on_fresh_output() {
+    for format in ["psse", "psse34", "psse35", "psse-rawx"] {
+        for (variable, at) in [
+            (ImpedanceCorrectionVariable::Ratio, 0.8),
+            (ImpedanceCorrectionVariable::Angle, -30.0),
+        ] {
+            let imaginary = if format == "psse" { 0.0 } else { 0.1 };
+            let network = network_with_correction(ImpedanceCorrection::new(
+                7,
+                variable,
+                vec![ImpedanceCorrectionPoint::new(at, 1.2, imaginary)],
+            ));
+            let expected = (
+                network.branches()[0].r * 1.2 - network.branches()[0].x * imaginary,
+                network.branches()[0].r * imaginary + network.branches()[0].x * 1.2,
+            );
+            let module = powerio::PioModule::new(PioValue::BalancedNetwork(network));
+            let mut source =
+                memory_text(emit(&module, format, Destination::memory("case").unwrap()).unwrap());
+            if format == "psse-rawx" {
+                let mut root: serde_json::Value = serde_json::from_str(&source).unwrap();
+                root["network"]["impcor"]["data"] = serde_json::json!([[7, at, 1.2, imaginary]]);
+                source = root.to_string();
+            } else {
+                let record = source
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("7,"))
+                    .unwrap();
+                let singleton = if format == "psse" {
+                    format!("7, {at}, 1.2, 0.0, 0.0")
+                } else {
+                    format!("7, {at}, 1.2, {imaginary}, 0.0, 0.0, 0.0")
+                };
+                source = source.replace(record, &singleton);
+            }
+            let read = |text: String| {
+                let module = parse(
+                    Source::from_memory("case", text.into_bytes())
+                        .unwrap()
+                        .with_format(FormatId::new(format).unwrap()),
+                )
+                .unwrap();
+                let PioValue::BalancedNetwork(network) = module.into_value() else {
+                    panic!("balanced network expected")
+                };
+                network
+            };
+            let network = read(source);
+            let correction = network.branches()[0].impedance_correction().unwrap();
+            assert_eq!(correction.variable, variable);
+            assert_eq!(correction.points.len(), 1);
+            for applied in [false, true] {
+                let mut network = network.clone();
+                if applied {
+                    network.apply_impedance_correction();
+                    assert!((network.branches()[0].r - expected.0).abs() < 1e-12);
+                    assert!((network.branches()[0].x - expected.1).abs() < 1e-12);
+                }
+                let module = powerio::PioModule::new(PioValue::BalancedNetwork(network));
+                let fresh = memory_text(
+                    emit(&module, format, Destination::memory("fresh").unwrap()).unwrap(),
+                );
+                let mut back = read(fresh);
+                let correction = back.branches()[0].impedance_correction().unwrap();
+                assert_eq!(correction.variable, variable);
+                assert_eq!(correction.points.len(), 2);
+                for at in [-60.0, 0.5, 0.8, 1.0, 1.5, 60.0] {
+                    assert_eq!(correction.calc_factor(at), Some((1.2, imaginary)));
+                }
+                back.apply_impedance_correction();
+                assert!((back.branches()[0].r - expected.0).abs() < 1e-12);
+                assert!((back.branches()[0].x - expected.1).abs() < 1e-12);
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_correction_tables_refuse_fresh_output_before_losing_case_state() {
+    for (format, count) in [("psse", 12), ("psse35", 100), ("psse-rawx", 100)] {
+        for applied in [false, true] {
+            let points = (0..count)
+                .map(|index| {
+                    ImpedanceCorrectionPoint::new(
+                        0.9 + f64::from(index) * 0.002,
+                        1.0 + f64::from(index) * 0.001,
+                        0.0,
+                    )
+                })
+                .collect();
+            let mut network = network_with_correction(ImpedanceCorrection::new(
+                7,
+                ImpedanceCorrectionVariable::Ratio,
+                points,
+            ));
+            if applied {
+                network.apply_impedance_correction();
+            }
+            let module = powerio::PioModule::new(PioValue::BalancedNetwork(network));
+            let error = emit(&module, format, Destination::memory("fresh").unwrap()).unwrap_err();
+            assert!(
+                error.to_string().contains("impedance correction table 7"),
+                "{error}"
+            );
+            assert!(error.to_string().contains("must contain"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn correction_tables_and_winding2_ratio_survive_storage_and_normalization() {
+    let mut root: serde_json::Value = serde_json::from_str(RAWX).unwrap();
+    root["network"]["transformer"] = serde_json::json!({
+        "fields": ["ibus", "jbus", "kbus", "ckt", "cw", "cz", "r1_2", "x1_2", "windv1", "windv2", "tab1"],
+        "data": [[1, 2, 0, "T1", 1, 1, 0.02, 0.2, 1.05, 0.98, 7]]
+    });
+    root["network"]["impcor"] = serde_json::json!({
+        "fields": ["itable", "tap", "refact", "imfact"],
+        "data": [[7, 0.9, 1.1, 0.1], [7, 1.1, 1.2, -0.1]]
+    });
+    let module =
+        parse(Source::from_memory("correction.rawx", root.to_string().into_bytes()).unwrap())
+            .unwrap();
+    let stored = memory_text(
+        serialize(&module, Destination::memory("correction.pio.json").unwrap()).unwrap(),
+    );
+    let restored =
+        deserialize(Source::from_memory("correction.pio.json", stored.into_bytes()).unwrap())
+            .unwrap();
+    let PioValue::BalancedNetwork(network) = restored.value() else {
+        panic!("balanced network expected")
+    };
+    let branch = &network.branches()[1];
+    assert_eq!(branch.extras["psse_winding2_ratio"], 0.98);
+    let correction = branch.impedance_correction().unwrap();
+    let normalized = network.to_normalized().unwrap();
+    assert_eq!(normalized.branches()[1].extras["psse_winding2_ratio"], 0.98);
+    assert_eq!(
+        normalized.branches()[1].impedance_correction(),
+        Some(correction.clone())
+    );
+    let fresh = memory_text(
+        emit(
+            &restored,
+            "psse-rawx",
+            Destination::memory("fresh.rawx").unwrap(),
+        )
+        .unwrap(),
+    );
+    let reparsed = parse(Source::from_memory("fresh.rawx", fresh.into_bytes()).unwrap()).unwrap();
+    let PioValue::BalancedNetwork(back) = reparsed.value() else {
+        panic!("balanced network expected")
+    };
+    assert_eq!(back.branches()[1].extras["psse_winding2_ratio"], 0.98);
+    let recovered = back.branches()[1].impedance_correction().unwrap();
+    for (a, b) in recovered.points.iter().zip(correction.points) {
+        assert!((a.value - b.value).abs() < 1e-12);
+        assert!((a.factor_re - b.factor_re).abs() < 1e-12);
+        assert!((a.factor_im - b.factor_im).abs() < 1e-12);
+    }
 }
 
 #[test]

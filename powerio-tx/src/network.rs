@@ -2497,6 +2497,10 @@ pub struct Branch {
     /// JSON written before the field existed still deserializes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<Vec<Location>>,
+    /// Source-specific data. PSS/E two-winding transformers retain the
+    /// winding-2 ratio on its bus voltage base as `psse_winding2_ratio`;
+    /// `tap` is winding 1 divided by that ratio and `r + jx` already includes
+    /// its squared impedance referral.
     pub extras: Extras,
 }
 
@@ -2578,8 +2582,18 @@ impl ImpedanceCorrection {
     /// for a table with no points.
     #[must_use]
     pub fn calc_factor(&self, value: f64) -> Option<(f64, f64)> {
-        let mut points = self.points.clone();
-        points.sort_by(|a, b| a.value.total_cmp(&b.value));
+        let mut sorted;
+        let points = if self
+            .points
+            .windows(2)
+            .all(|pair| pair[0].value.total_cmp(&pair[1].value).is_le())
+        {
+            &self.points
+        } else {
+            sorted = self.points.clone();
+            sorted.sort_by(|a, b| a.value.total_cmp(&b.value));
+            &sorted
+        };
         let first = points.first()?;
         let last = points.last()?;
         if value <= first.value {
@@ -3750,7 +3764,8 @@ impl Transformer3W {
     /// The sole adjustable winding for PSS/E bus-to-bus correction. The
     /// sign of COD enables regulation but does not change which winding the
     /// tables describe: a disabled nonzero control remains adjustable.
-    pub(crate) fn impedance_correction_control_winding(&self) -> Option<usize> {
+    #[must_use]
+    pub fn impedance_correction_control_winding(&self) -> Option<usize> {
         let mut adjustable = self
             .windings
             .iter()
@@ -3816,6 +3831,10 @@ impl Transformer3W {
     /// bus carries the stored star voltage and the magnetizing shunt is left to the
     /// caller; each branch takes its winding's tap, phase shift, ratings, and
     /// status, so a winding out of service gives an out of service branch.
+    /// Independent winding corrections and their nominal impedances follow the
+    /// branches. PSS/E `ZCOD=1` corrections couple all three star impedances:
+    /// apply those to the native transformer before expanding it, and repeat
+    /// the expansion after moving its controlling winding.
     #[must_use]
     pub fn to_star_expansion(&self, star_id: BusId) -> (Bus, [Branch; 3]) {
         let star = Bus {
@@ -3866,9 +3885,30 @@ impl Transformer3W {
             branch(&self.windings[2], zs[2]),
         ];
         let windings_in_service = self.winding_in_service();
+        let independent_corrections =
+            self.extras.get("psse_zcod").and_then(Value::as_i64) != Some(1);
+        let nominal = self
+            .extras
+            .get(IMPEDANCE_CORRECTION_NOMINAL_EXTRA)
+            .and_then(|value| <[[f64; 2]; 3]>::deserialize(value).ok());
         for (k, branch) in branches.iter_mut().enumerate() {
             branch.in_service &= windings_in_service[k];
             branch.rating_sets = self.winding_rating_sets(k);
+            if independent_corrections
+                && let Some(correction) = self.winding_impedance_correction(k)
+            {
+                branch.set_impedance_correction(Some(correction));
+                if let Some(z) = nominal {
+                    let (a, b, c) = [(0, 2, 1), (0, 1, 2), (1, 2, 0)][k];
+                    let star = std::array::from_fn::<_, 2, _>(|part| {
+                        (z[a][part] + z[b][part] - z[c][part]) / 2.0
+                    });
+                    branch.extras.insert(
+                        IMPEDANCE_CORRECTION_NOMINAL_EXTRA.into(),
+                        serde_json::json!(star),
+                    );
+                }
+            }
         }
         (star, branches)
     }
@@ -6897,6 +6937,11 @@ mod tests {
         let (re, im) = table.calc_factor(15.0).unwrap();
         close(re, 1.1);
         close(im, -0.1);
+        let mut sorted = table.clone();
+        sorted.points.sort_by(|a, b| a.value.total_cmp(&b.value));
+        for value in [-45.0, -15.0, 0.0, 15.0, 45.0] {
+            assert_eq!(sorted.calc_factor(value), table.calc_factor(value));
+        }
         let single = ImpedanceCorrection::new(
             2,
             ImpedanceCorrectionVariable::Ratio,

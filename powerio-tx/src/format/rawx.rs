@@ -6,6 +6,7 @@
 //! `.raw` reader and writer in [`super::psse`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
@@ -61,6 +62,8 @@ const TRANSFORMER_IMPEDANCE_FIELDS: &[&str] = &[
     "anstar",
 ];
 const AREA_FIELDS: &[&str] = &["iarea", "isw", "pdes", "ptol", "arname"];
+// PSS/E 35.4.1 Data Formats §1.18: one row per point, without RAW's terminator.
+const IMPEDANCE_CORRECTION_FIELDS: &[&str] = &["itable", "tap", "refact", "imfact"];
 /// The revision 35 FACTS device record, field for field.
 const FACTS_FIELDS: &[&str] = &[
     "name", "ibus", "jbus", "mode", "pdes", "qdes", "vset", "shmx", "trmx", "vtmn", "vtmx", "vsmx",
@@ -109,7 +112,6 @@ const SUBSTATION_TERMINAL_FIELDS: &[&str] =
 const EXPLICIT_NULL: &str = "null";
 
 const UNSUPPORTED_TABLES: &[(&str, &str)] = &[
-    ("impcor", "transformer impedance correction tables"),
     ("ntermdc", "multi-terminal DC lines"),
     ("ntermdcconv", "multi-terminal DC converters"),
     ("ntermdcbus", "multi-terminal DC buses"),
@@ -439,6 +441,7 @@ pub(super) fn parse_rawx_source(
     raw.push_str("0 / END OF TWO-TERMINAL DC DATA, BEGIN VSC DC LINE DATA\n");
     append_vsc_dc(network, &mut raw, warnings, &mut substituted_strings)?;
     raw.push_str("0 / END OF VSC DC LINE DATA, BEGIN IMPEDANCE CORRECTION DATA\n");
+    append_impedance_corrections(network, &mut raw, warnings)?;
     raw.push_str("0 / END OF IMPEDANCE CORRECTION DATA, BEGIN MULTI-TERMINAL DC DATA\n");
     raw.push_str("0 / END OF MULTI-TERMINAL DC DATA, BEGIN MULTI-SECTION LINE DATA\n");
     raw.push_str("0 / END OF MULTI-SECTION LINE DATA, BEGIN ZONE DATA\n");
@@ -519,6 +522,49 @@ fn append_simple_table(
             substituted_strings,
         )?);
         out.push('\n');
+    }
+    Ok(())
+}
+
+fn append_impedance_corrections(
+    network: &Map<String, Value>,
+    out: &mut String,
+    warnings: &mut Diagnostics,
+) -> Result<()> {
+    let Some(table) = Table::parse(network, "impcor")? else {
+        return Ok(());
+    };
+    table.warn_unknown_fields(IMPEDANCE_CORRECTION_FIELDS, warnings);
+    let mut tables = BTreeMap::<i64, Vec<[f64; 3]>>::new();
+    for row in table.rows {
+        let number = integer_value(table.value(row, "itable"), "impcor.itable", None)?;
+        if !(1..=i64::from(u32::MAX)).contains(&number) {
+            return Err(malformed(
+                "impcor.itable must be a positive u32 table number",
+            ));
+        }
+        let read = |field| {
+            numeric_value(
+                table.value(row, field),
+                &format!("impcor.{field}"),
+                Some(0.0),
+            )
+        };
+        let point = [read("tap")?, read("refact")?, read("imfact")?];
+        // A zero row is not a RAWX terminator; reject it before synthesizing RAW.
+        if point[1] == 0.0 && point[2] == 0.0 {
+            return Err(malformed(format!(
+                "RAWX impedance correction table {number} has a zero scaling factor"
+            )));
+        }
+        tables.entry(number).or_default().push(point);
+    }
+    for (number, points) in tables {
+        let _ = write!(out, "{number}, ");
+        for [tap, re, im] in points {
+            let _ = writeln!(out, "{tap:?}, {re:?}, {im:?}");
+        }
+        out.push_str("0.0, 0.0, 0.0\n");
     }
     Ok(())
 }
@@ -1937,6 +1983,7 @@ fn transformer_fields() -> Vec<String> {
 /// Emit a neutral network through the shared PSS/E revision 35 writer, then
 /// encode those records as RAWX tables.
 pub(crate) fn write_rawx(net: &BalancedNetwork) -> Result<TextEmission> {
+    super::psse::validate_impedance_correction_emission(net, 35)?;
     let allocated_node_numbers = net
         .detailed_connectivity()
         .as_deref()
@@ -2019,6 +2066,7 @@ fn raw_to_rawx(net: &BalancedNetwork, raw: &str, diagnostics: &mut Diagnostics) 
     add_simple_output_table(&mut network, "area", AREA_FIELDS, &["arname"], &sections);
     add_two_terminal_output_table(&mut network, &sections)?;
     add_vsc_output_table(&mut network, &sections)?;
+    add_impedance_correction_output_table(&mut network, &sections)?;
     add_simple_output_table(
         &mut network,
         "swshunt",
@@ -2034,15 +2082,6 @@ fn raw_to_rawx(net: &BalancedNetwork, raw: &str, diagnostics: &mut Diagnostics) 
         &sections,
     );
     add_system_switch_output_table(&mut network, net, diagnostics);
-    if sections
-        .get("IMPEDANCE CORRECTION")
-        .is_some_and(|lines| !lines.is_empty())
-    {
-        diagnostics.push(
-            &codes::EMIT_PSSE.record_dropped,
-            "transformer impedance correction tables dropped: the RAWX writer writes no impcor table, so a transformer that names one keeps the number without the table",
-        );
-    }
     apply_detailed_equipment_ids(&mut network, net)?;
     add_detailed_connectivity_output_tables(&mut network, net, diagnostics)?;
 
@@ -2206,6 +2245,57 @@ fn add_simple_output_table(
     if !rows.is_empty() {
         network.insert(name.to_owned(), table_object(fields, Value::Array(rows)));
     }
+}
+
+fn add_impedance_correction_output_table(
+    network: &mut Map<String, Value>,
+    sections: &RawSections,
+) -> Result<()> {
+    let Some(lines) = sections.get("IMPEDANCE CORRECTION") else {
+        return Ok(());
+    };
+    let mut rows = Vec::new();
+    let mut table = None;
+    for line in lines {
+        let tokens = line_tokens(line);
+        let start = if table.is_none() {
+            table = tokens.first().cloned();
+            1
+        } else {
+            0
+        };
+        let (points, remainder) = tokens[start..].as_chunks::<3>();
+        if !remainder.is_empty() {
+            return Err(malformed(
+                "internal PSS/E impedance correction point is truncated",
+            ));
+        }
+        for point in points {
+            let mut tokens =
+                vec![table.clone().ok_or_else(|| {
+                    malformed("internal PSS/E correction table number is missing")
+                })?];
+            tokens.extend_from_slice(point);
+            let values = tokens_as_values(&tokens, IMPEDANCE_CORRECTION_FIELDS, &[])?;
+            if values[1..].iter().all(|value| value.as_f64() == Some(0.0)) {
+                table = None;
+            } else {
+                rows.push(Value::Array(values));
+            }
+        }
+    }
+    if table.is_some() {
+        return Err(malformed(
+            "internal PSS/E impedance correction table is unterminated",
+        ));
+    }
+    if !rows.is_empty() {
+        network.insert(
+            "impcor".into(),
+            table_object(IMPEDANCE_CORRECTION_FIELDS, Value::Array(rows)),
+        );
+    }
+    Ok(())
 }
 
 fn add_transformer_output_table(
@@ -3468,6 +3558,199 @@ mod tests {
 
     fn close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+    }
+
+    fn set_table_value(root: &mut Value, table: &str, row: usize, field: &str, value: Value) {
+        let table = &mut root["network"][table];
+        let column = table["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|candidate| candidate == field);
+        let column = column.unwrap_or_else(|| {
+            let fields = table["fields"].as_array_mut().unwrap();
+            fields.push(Value::from(field));
+            let column = fields.len() - 1;
+            for row in table["data"].as_array_mut().unwrap() {
+                row.as_array_mut().unwrap().push(Value::Null);
+            }
+            column
+        });
+        table["data"][row][column] = value;
+    }
+
+    fn correction_case(cw: u32, zcod: u32) -> Value {
+        let mut root: Value = serde_json::from_str(TRANSFORMERS_AND_SWITCH).unwrap();
+        for row in 0..2 {
+            set_table_value(&mut root, "transformer", row, "cw", Value::from(cw));
+            for (winding, (ratio, base, nominal)) in [
+                (1.05, 230.0, 220.0),
+                (0.98, 115.0, 110.0),
+                (0.95, 69.0, 66.0),
+            ]
+            .into_iter()
+            .enumerate()
+            .take(if row == 0 { 2 } else { 3 })
+            {
+                let windv = match cw {
+                    2 => ratio * base,
+                    3 => ratio * base / nominal,
+                    _ => ratio,
+                };
+                set_table_value(
+                    &mut root,
+                    "transformer",
+                    row,
+                    &format!("windv{}", winding + 1),
+                    Value::from(windv),
+                );
+                set_table_value(
+                    &mut root,
+                    "transformer",
+                    row,
+                    &format!("nomv{}", winding + 1),
+                    Value::from(nominal),
+                );
+            }
+            let limit = |ratio: f64| match cw {
+                2 => ratio * 230.0,
+                3 => ratio * 230.0 / 220.0,
+                _ => ratio,
+            };
+            set_table_value(
+                &mut root,
+                "transformer",
+                row,
+                "rma1",
+                Value::from(limit(1.1)),
+            );
+            set_table_value(
+                &mut root,
+                "transformer",
+                row,
+                "rmi1",
+                Value::from(limit(0.9)),
+            );
+            set_table_value(&mut root, "transformer", row, "tab1", Value::from(2));
+        }
+        set_table_value(&mut root, "transformer", 1, "zcod", Value::from(zcod));
+        set_table_value(&mut root, "transformer", 1, "cod1", Value::from(-1));
+        set_table_value(
+            &mut root,
+            "transformer",
+            1,
+            "tab2",
+            Value::from(if zcod == 0 { 1 } else { 2 }),
+        );
+        set_table_value(&mut root, "transformer", 1, "tab3", Value::from(2));
+        // Deliberately reordered columns and interleaved tables. Table 1 also
+        // has a zero-degree point, which is data rather than a RAW terminator.
+        root["network"]["impcor"] = serde_json::json!({
+            "fields": ["imfact", "itable", "refact", "tap"],
+            "data": [[0.1, 1, 1.5, -60.0], [0.1, 2, 1.1, 0.9], [0.0, 1, 1.0, 0.0],
+                     [0.0, 2, 1.0, 1.0], [-0.1, 1, 1.5, 60.0], [-0.1, 2, 1.05, 1.1]]
+        });
+        root
+    }
+
+    #[test]
+    fn impedance_corrections_roundtrip_fresh_rawx_for_all_winding_codes() {
+        for cw in [1, 2, 3] {
+            for zcod in [0, 1] {
+                let root = correction_case(cw, zcod);
+                let mut original =
+                    parse_rawx_source(&root.to_string(), None, &mut Diagnostics::new()).unwrap();
+                close(
+                    original.branches()[0].extras["psse_winding2_ratio"]
+                        .as_f64()
+                        .unwrap(),
+                    0.98,
+                );
+                close(original.branches()[0].tap, 1.05 / 0.98);
+                let correction = original.branches()[0].impedance_correction().unwrap();
+                for (point, tap) in correction.points.iter().zip([0.9, 1.0, 1.1]) {
+                    close(point.value, tap / 0.98);
+                }
+                original.apply_impedance_correction();
+                let emitted = write_rawx(&original).unwrap();
+                assert!(
+                    !emitted
+                        .render_diagnostics()
+                        .iter()
+                        .any(|message| message.contains("impedance correction tables dropped"))
+                );
+                let output: Value = serde_json::from_str(&emitted.text).unwrap();
+                assert_eq!(
+                    output["network"]["impcor"]["fields"],
+                    serde_json::json!(["itable", "tap", "refact", "imfact"])
+                );
+                let points = output["network"]["impcor"]["data"].as_array().unwrap();
+                assert!(points.len() >= if zcod == 0 { 6 } else { 3 });
+                assert!(
+                    points
+                        .iter()
+                        .all(|point| point[2].as_f64() != Some(0.0)
+                            || point[3].as_f64() != Some(0.0))
+                );
+                let mut back =
+                    parse_rawx_source(&emitted.text, None, &mut Diagnostics::new()).unwrap();
+                close(
+                    back.branches()[0].extras["psse_winding2_ratio"]
+                        .as_f64()
+                        .unwrap(),
+                    0.98,
+                );
+                close(
+                    back.branches()[0].control.as_ref().unwrap().tap_max,
+                    original.branches()[0].control.as_ref().unwrap().tap_max,
+                );
+                close(
+                    back.branches()[0].calc_terminal_charging().g_fr,
+                    original.branches()[0].calc_terminal_charging().g_fr,
+                );
+                for tap in [1.05, 0.85, 0.95, 1.0, 1.15] {
+                    original.branches_mut()[0].tap = tap / 0.98;
+                    back.branches_mut()[0].tap = tap / 0.98;
+                    for net in [&mut original, &mut back] {
+                        for winding in &mut net.transformers_3w_mut()[0].windings {
+                            winding.tap = tap;
+                            winding.shift = -30.0;
+                        }
+                        net.apply_impedance_correction();
+                    }
+                    close(back.branches()[0].r, original.branches()[0].r);
+                    close(back.branches()[0].x, original.branches()[0].x);
+                    for (a, b) in back.transformers_3w()[0]
+                        .z
+                        .iter()
+                        .zip(original.transformers_3w()[0].z)
+                    {
+                        close(a.r, b.r);
+                        close(a.x, b.x);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn impedance_corrections_reject_malformed_rawx_points_and_missing_tables() {
+        for points in [
+            serde_json::json!([]),
+            serde_json::json!([[2, 0.9, 0.0, 0.0], [2, 1.1, 1.0, 0.0]]),
+            serde_json::json!([[2, 1.1, 1.0, 0.0], [2, 0.9, 1.0, 0.0]]),
+            serde_json::json!([[2, 0.9, 1.0, 0.0], [2, 0.9, 1.0, 0.0]]),
+            serde_json::json!([[2, 0.9, "NaN", 0.0], [2, 1.1, 1.0, 0.0]]),
+            serde_json::json!([[2, 0.9, 1.0, 0.0], [2, 1.1, 1.0, 0.0], [2, 0.0, 0.0, 0.0]]),
+        ] {
+            let mut root = correction_case(1, 1);
+            root["network"]["impcor"] =
+                serde_json::json!({"fields": IMPEDANCE_CORRECTION_FIELDS, "data": points});
+            assert!(
+                parse_rawx_source(&root.to_string(), None, &mut Diagnostics::new()).is_err(),
+                "{root}"
+            );
+        }
     }
 
     fn table_value(root: &Value, table: &str, row: usize, field: &str) -> Value {
